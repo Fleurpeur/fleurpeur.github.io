@@ -2,6 +2,9 @@ name: fetch-artwork
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - claude/high-resolution-image-download-uyp1le
 
 permissions:
   contents: write
