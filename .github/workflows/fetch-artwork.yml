@@ -1,0 +1,117 @@
+name: fetch-artwork
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch artwork page and discover image source
+        run: |
+          set -x
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+          PAGE_URL='https://www.staatsgalerie.de/de/sammlung-digital/schloss-und-gestuet-weil-bei-esslingen'
+          curl -sSL -A "$UA" "$PAGE_URL" -o page.html
+          wc -c page.html
+          # JSON payloads often escape slashes; make a normalized copy
+          sed 's/\\\//\//g' page.html > page_norm.html
+
+          echo "==== IIIF / tile-server candidates ===="
+          grep -oE 'https?://[^"'"'"' <>\\]+' page_norm.html | grep -iE 'iiif|info\.json|\.ptif|\.dzi|deepzoom|zoomify|tile' | sort -u | tee iiif_candidates.txt || true
+
+          echo "==== All image URLs found in page ===="
+          grep -oE 'https?://[^"'"'"' <>\\]+\.(jpe?g|png|tif+|webp)[^"'"'"' <>\\]*' page_norm.html | sort -u | tee image_urls.txt || true
+
+          echo "==== Download-button style links ===="
+          grep -oiE 'href="[^"]*(download|original|master)[^"]*"' page_norm.html | head -50 || true
+
+          echo "==== Inline data attributes mentioning image/zoom ===="
+          grep -oE '[a-z-]*data-[a-z-]+="[^"]{0,400}"' page_norm.html | grep -iE 'zoom|iiif|image' | head -60 || true
+
+      - name: Try to download full resolution
+        run: |
+          set -x
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+          mkdir -p out
+
+          # Locate an info.json (IIIF Image API) among candidates
+          INFO=$(grep -m1 'info\.json' iiif_candidates.txt || true)
+          if [ -z "$INFO" ]; then
+            # Try deriving info.json from any /iiif/ path
+            BASE=$(grep -m1 -E '/iiif/' iiif_candidates.txt || true)
+            if [ -n "$BASE" ]; then
+              INFO="${BASE%/}/info.json"
+            fi
+          fi
+          echo "INFO=$INFO"
+
+          if [ -n "$INFO" ]; then
+            curl -sSL -A "$UA" "$INFO" -o info.json || true
+            cat info.json || true
+            ID=$(python3 -c "import json;print(json.load(open('info.json')).get('@id') or json.load(open('info.json')).get('id',''))" 2>/dev/null || true)
+            echo "IIIF ID=$ID"
+            if [ -n "$ID" ]; then
+              for size in "full/full" "full/max"; do
+                echo "trying $ID/$size/0/default.jpg"
+                if curl -fSL -A "$UA" "$ID/$size/0/default.jpg" -o out/artwork_direct.jpg; then
+                  break
+                fi
+              done
+            fi
+          fi
+
+          # Fallback / better quality: dezoomify-rs stitches all tiles at max zoom
+          if [ ! -s out/artwork_direct.jpg ] || [ "$(stat -c%s out/artwork_direct.jpg 2>/dev/null || echo 0)" -lt 500000 ]; then
+            DL=$(curl -s https://api.github.com/repos/lovasoa/dezoomify-rs/releases/latest | grep -oE '"browser_download_url": *"[^"]+linux[^"]*"' | grep -v musl | head -1 | grep -oE 'https[^"]+')
+            echo "dezoomify url: $DL"
+            curl -sSL "$DL" -o dz.tgz && tar xzf dz.tgz
+            TARGET="${INFO:-https://www.staatsgalerie.de/de/sammlung-digital/schloss-und-gestuet-weil-bei-esslingen}"
+            ./dezoomify-rs --largest --header "User-Agent: $UA" "$TARGET" out/artwork_stitched.jpg || true
+          fi
+
+          ls -la out/ || true
+          for f in out/*; do
+            [ -f "$f" ] && python3 -c "from PIL import Image; im=Image.open('$f'); print('$f', im.size)" 2>/dev/null || true
+          done
+
+      - name: Upload results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: artwork-and-debug
+          path: |
+            out/
+            page.html
+            iiif_candidates.txt
+            image_urls.txt
+            info.json
+          if-no-files-found: warn
+
+      - name: Commit best image to branch
+        run: |
+          set -x
+          BEST=""
+          BESTSIZE=0
+          for f in out/*.jpg out/*.png out/*.jpeg; do
+            [ -f "$f" ] || continue
+            S=$(stat -c%s "$f")
+            if [ "$S" -gt "$BESTSIZE" ]; then BEST="$f"; BESTSIZE=$S; fi
+          done
+          echo "best: $BEST ($BESTSIZE bytes)"
+          if [ -n "$BEST" ]; then
+            mkdir -p artwork
+            cp "$BEST" "artwork/steinkopf-schloss-und-gestuet-weil.jpg"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add artwork/
+            git commit -m "Add high-resolution artwork download [skip ci]" || echo "nothing to commit"
+            git push
+          else
+            echo "No image obtained"; exit 1
+          fi
