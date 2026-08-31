@@ -1,0 +1,136 @@
+name: fetch-artwork
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/high-resolution-image-download-uyp1le
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    env:
+      PAGE_URL: "https://www.emuseum.ch/de/objects/60821/zum-gluck-gibts-bier?ctx=05d22e4f38b846cde7ba990ebaf9fbee83b74402&idx=18"
+      UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render page in headless Chrome and capture network requests
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install puppeteer-core@23 >/dev/null 2>&1
+          CHROME=$(command -v google-chrome || command -v chromium-browser || command -v chromium)
+          echo "chrome: $CHROME"
+          export CHROME
+          cat > capture.js <<'EOF'
+          const fs = require('fs');
+          const puppeteer = require('puppeteer-core');
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath: process.env.CHROME,
+              args: ['--no-sandbox', '--disable-dev-shm-usage'],
+            });
+            const page = await browser.newPage();
+            await page.setUserAgent(process.env.UA);
+            await page.setViewport({width: 1600, height: 1000});
+            const urls = new Set();
+            page.on('request', r => urls.add(r.url()));
+            try {
+              await page.goto(process.env.PAGE_URL, {waitUntil: 'networkidle2', timeout: 90000});
+            } catch (e) { console.error('goto:', e.message); }
+            await new Promise(r => setTimeout(r, 6000));
+            for (const sel of ['button#onetrust-accept-btn-handler', 'button[class*="accept" i]',
+                               'button[class*="consent" i]', 'a[class*="accept" i]']) {
+              try { await page.click(sel); console.log('clicked cookie:', sel);
+                    await new Promise(r => setTimeout(r, 2000)); break; } catch (e) {}
+            }
+            for (const sel of ['.emuseum-detail-image img', '.media-frame img', 'figure img',
+                               '[class*="zoom" i]', '[aria-label*="zoom" i]', 'main img']) {
+              try { await page.click(sel); console.log('clicked:', sel);
+                    await new Promise(r => setTimeout(r, 4000)); } catch (e) {}
+            }
+            try {
+              for (let i = 0; i < 4; i++) {
+                await page.mouse.move(800, 500);
+                await page.mouse.wheel({deltaY: -500});
+                await new Promise(r => setTimeout(r, 1200));
+              }
+            } catch (e) {}
+            await new Promise(r => setTimeout(r, 4000));
+            fs.writeFileSync('rendered.html', await page.content());
+            fs.writeFileSync('requests.txt', [...urls].join('\n'));
+            await browser.close();
+          })();
+          EOF
+          node capture.js || true
+          echo "==== captured requests (media-related) ===="
+          grep -iE 'dispatcher|media|image|iiif|\.jpe?g|\.png|\.tif' requests.txt || true
+          echo "==== og:image and main img tags ===="
+          grep -oE '<meta[^>]*og:image[^>]*>' rendered.html || true
+          grep -oE '<img[^>]{0,500}>' rendered.html | grep -iE 'dispatcher|media' | head -20 || true
+
+      - name: Download all resolution variants
+        run: |
+          set -x
+          mkdir -p out
+          {
+            grep -oE 'https?://[^"'"'"' <>\\]+' rendered.html || true
+            cat requests.txt || true
+          } | sed 's/&amp;/\&/g' | sort -u > all_urls.txt
+
+          # eMuseum (Gallery Systems) media dispatcher ids
+          grep -oE 'dispatcher/[0-9]+' all_urls.txt | grep -oE '[0-9]+' | sort -un > media_ids.txt
+          cat media_ids.txt
+          HOST="https://www.emuseum.ch"
+
+          while read -r MID; do
+            [ -n "$MID" ] || continue
+            for VAR in "resolution=superImageResolution" "resolution=highRes" "preview" ""; do
+              URL="$HOST/internal/media/dispatcher/$MID/$VAR"
+              URL="${URL%/}"
+              SAFE=$(echo "$VAR" | tr -cd 'a-zA-Z' )
+              OUTF="out/m${MID}_${SAFE:-bare}.img"
+              curl -fsSL -A "$UA" -H "Referer: $PAGE_URL" "$URL" -o "$OUTF" || rm -f "$OUTF"
+            done
+          done < media_ids.txt
+
+          # also fetch any direct image URLs found (jpg/png/tif)
+          i=0
+          grep -iE '\.(jpe?g|png|tif+)([?#]|$)' all_urls.txt | head -20 | while read -r U; do
+            i=$((i+1))
+            curl -fsSL -A "$UA" -H "Referer: $PAGE_URL" "$U" -o "out/direct_$i.img" || rm -f "out/direct_$i.img"
+          done
+
+          ls -la out/ || true
+          for f in out/*; do
+            [ -f "$f" ] || continue
+            [ "$(stat -c%s "$f")" -lt 20000 ] && rm -f "$f" && continue
+            identify -format "%f %m %wx%h %B bytes\n" "$f" 2>/dev/null || file "$f"
+          done
+
+      - name: Commit downloads to branch
+        run: |
+          set -x
+          mkdir -p artwork/emuseum
+          KEEP=0
+          for f in out/*; do
+            [ -f "$f" ] || continue
+            FMT=$(identify -format "%m" "$f" 2>/dev/null || echo BAD)
+            case "$FMT" in JPEG|PNG|TIFF) ;; *) continue;; esac
+            EXT=$(echo "$FMT" | tr 'A-Z' 'a-z' | sed 's/jpeg/jpg/')
+            cp "$f" "artwork/emuseum/$(basename "${f%.img}").$EXT"
+            KEEP=$((KEEP+1))
+          done
+          if [ "$KEEP" -gt 0 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git add artwork/
+            git commit -m "Add emuseum image variants [skip ci]" || echo "nothing to commit"
+            git push
+          else
+            echo "No images obtained"; exit 1
+          fi
